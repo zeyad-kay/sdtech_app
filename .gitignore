@@ -13,3 +13,7 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# ASR model asset — 585MB, exceeds GitHub's 100MB file size limit.
+# Place it manually at this path to enable on-device transcription.
+/app/src/main/assets/parakeet_tdt/model.tflite
