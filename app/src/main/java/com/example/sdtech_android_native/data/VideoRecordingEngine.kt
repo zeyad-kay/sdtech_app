@@ -29,6 +29,8 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "VideoRecordingEngine"
@@ -56,10 +58,17 @@ data class EncodedVideoFrame(
  * the same way it already tails audio, instead of waiting up to
  * [SEGMENT_SECONDS] for the first usable file.
  *
- * One `CameraCaptureSession` feeds two surfaces at once — the live preview
- * (a plain [SurfaceTexture], e.g. from a `TextureView`) and the encoder's
- * input surface — since CameraX's `Preview` use case only supports a single
- * output and doesn't expose a way to tap the raw encoded bitstream.
+ * The camera's only capture target is [CameraGlRenderer]'s own
+ * camera-facing `SurfaceTexture` — not the live preview or the encoder
+ * directly. [CameraGlRenderer] then renders each frame, via OpenGL, to both
+ * the preview surface and the encoder's input surface, applying
+ * `SurfaceTexture.getTransformMatrix()` explicitly for both. A raw Camera2
+ * target surface (like the encoder's) gets no orientation/mirror correction
+ * on its own — only a `TextureView` applies that automatically, as part of
+ * its own rendering — so without this GL step the encoded video would come
+ * out flipped relative to what the on-screen preview shows. CameraX's
+ * `Preview` use case isn't used here since it only supports a single output
+ * and doesn't expose a way to tap the raw encoded bitstream either.
  *
  * The same encoder output still feeds a rotating [MediaMuxer], producing the
  * local 20s MP4 segments for the Recordings tab exactly as before; rotation
@@ -97,6 +106,13 @@ class VideoRecordingEngine(private val context: Context) {
     private var codec: MediaCodec? = null
     private var drainThread: Thread? = null
     private val shouldDrain = AtomicBoolean(false)
+
+    // Owns the EGL context that corrects orientation/mirroring before both
+    // the preview and the encoder ever see a frame — see CameraGlRenderer's
+    // kdoc. All GL/EGL calls for glRenderer happen on this thread.
+    private var glThread: HandlerThread? = null
+    private var glHandler: Handler? = null
+    private var glRenderer: CameraGlRenderer? = null
 
     // Only ever touched from the drain thread — see kdoc above.
     private var muxer: MediaMuxer? = null
@@ -149,6 +165,8 @@ class VideoRecordingEngine(private val context: Context) {
             shouldDrain.set(true)
             drainThread = Thread({ runDrainLoop(encoder) }, "VideoDrainThread").apply { start() }
 
+            val cameraSurface = startGlRenderer(previewSurface, encoderSurface)
+
             cameraThread = HandlerThread("VideoCameraThread").apply { start() }
             cameraHandler = Handler(cameraThread!!.looper)
 
@@ -163,7 +181,7 @@ class VideoRecordingEngine(private val context: Context) {
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         cameraDevice = camera
-                        openCaptureSession(camera, previewSurface, encoderSurface)
+                        openCaptureSession(camera, cameraSurface)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -186,16 +204,47 @@ class VideoRecordingEngine(private val context: Context) {
         }
     }
 
-    private fun openCaptureSession(camera: CameraDevice, previewSurface: Surface, encoderSurface: Surface) {
+    /**
+     * Spins up [glThread]/[glRenderer] and returns the camera-facing
+     * [Surface] the camera should actually target — see [CameraGlRenderer]'s
+     * kdoc. Synchronous (blocks up to 2s) because the caller needs that
+     * surface before it can open the camera.
+     */
+    private fun startGlRenderer(previewSurface: Surface, encoderSurface: Surface): Surface {
+        val thread = HandlerThread("VideoGlThread").apply { start() }
+        glThread = thread
+        val handler = Handler(thread.looper)
+        glHandler = handler
+
+        val latch = CountDownLatch(1)
+        var initError: Exception? = null
+        var cameraSurface: Surface? = null
+        handler.post {
+            try {
+                val renderer = CameraGlRenderer(previewSurface, encoderSurface, VIDEO_WIDTH, VIDEO_HEIGHT)
+                glRenderer = renderer
+                renderer.cameraSurfaceTexture.setOnFrameAvailableListener({ renderer.drawFrame() }, handler)
+                cameraSurface = renderer.cameraInputSurface
+            } catch (e: Exception) {
+                initError = e
+            } finally {
+                latch.countDown()
+            }
+        }
+        if (!latch.await(2, TimeUnit.SECONDS)) throw IllegalStateException("Timed out initializing GL renderer")
+        initError?.let { throw it }
+        return cameraSurface ?: throw IllegalStateException("GL renderer did not produce a camera surface")
+    }
+
+    private fun openCaptureSession(camera: CameraDevice, cameraSurface: Surface) {
         try {
             camera.createCaptureSession(
-                listOf(previewSurface, encoderSurface),
+                listOf(cameraSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         captureSession = session
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                            addTarget(previewSurface)
-                            addTarget(encoderSurface)
+                            addTarget(cameraSurface)
                         }
                         session.setRepeatingRequest(request.build(), null, cameraHandler)
                         _isRecording.value = true
@@ -242,12 +291,36 @@ class VideoRecordingEngine(private val context: Context) {
         }
         codec = null
 
+        stopGlRenderer()
+
         finishCurrentSegment()
 
         _isRecording.value = false
         _isStarting.value = false
         _secondsRemaining.value = SEGMENT_SECONDS
         _videoFormat.value = null
+    }
+
+    /** Releases [glRenderer] on [glThread] itself — EGL/GL calls must happen on the thread that owns the context — then tears the thread down. */
+    private fun stopGlRenderer() {
+        val handler = glHandler
+        if (handler != null) {
+            val latch = CountDownLatch(1)
+            handler.post {
+                try {
+                    glRenderer?.release()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error releasing GL renderer", e)
+                } finally {
+                    glRenderer = null
+                    latch.countDown()
+                }
+            }
+            latch.await(2, TimeUnit.SECONDS)
+        }
+        glThread?.quitSafely()
+        glThread = null
+        glHandler = null
     }
 
     fun deleteVideoFile(item: SavedMediaItem) {
@@ -334,12 +407,15 @@ class VideoRecordingEngine(private val context: Context) {
     /**
      * Called from [drainThread] itself when the encoder output queue dies
      * unexpectedly. Without this, the drain thread would just exit while the
-     * camera session, encoder and preview surface stay alive — since preview
-     * and encoder share one Camera2 capture request, the encoder's now-undrained
-     * input surface fills up and stalls the whole repeating request, freezing
-     * the live preview with no way to recover short of restarting the app.
-     * Runs [stopCapturing] on a fresh thread since it joins [drainThread],
-     * which would deadlock if called from the drain thread itself.
+     * camera session, encoder, and [CameraGlRenderer] stay alive — the
+     * encoder's now-undrained input surface fills up, which stalls
+     * [CameraGlRenderer.drawFrame]'s `eglSwapBuffers` to it, which in turn
+     * stops it calling `updateTexImage()` on the camera-facing
+     * `SurfaceTexture` — and that backs up all the way to the camera's own
+     * capture request, freezing the live preview too, with no way to recover
+     * short of restarting the app. Runs [stopCapturing] on a fresh thread
+     * since it joins [drainThread], which would deadlock if called from the
+     * drain thread itself.
      */
     private fun failCapture() {
         if (!shouldDrain.compareAndSet(true, false)) return
