@@ -46,9 +46,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.sdtech_android_native.asr.TranscriptionState
-import com.example.sdtech_android_native.data.AudioRecorderViewModel
-import com.example.sdtech_android_native.data.VideoRecorderViewModel
 import com.example.sdtech_android_native.model.SavedMediaItem
+import com.example.sdtech_android_native.session.AppSessionService
 import com.example.sdtech_android_native.ui.theme.DeepPurple
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -60,22 +59,19 @@ private enum class RecordingsFilter(val label: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RecordingsScreen(
-    audioViewModel: AudioRecorderViewModel,
-    videoViewModel: VideoRecorderViewModel,
-) {
+fun RecordingsScreen(service: AppSessionService) {
     var filter by remember { mutableStateOf(RecordingsFilter.AUDIO) }
     var menuExpanded by remember { mutableStateOf(false) }
 
     val showAudio = filter == RecordingsFilter.AUDIO
-    val audioFiles by audioViewModel.savedAudioFiles.collectAsState()
-    val videoFiles by videoViewModel.savedVideoFiles.collectAsState()
-    val isAudioRecording by audioViewModel.isRecording.collectAsState()
-    val isVideoRecording by videoViewModel.isRecording.collectAsState()
-    val transcriptions by audioViewModel.transcriptions.collectAsState()
+    val audioFiles by service.savedAudioFiles.collectAsState()
+    val videoFiles by service.savedVideoFiles.collectAsState()
+    val isAudioRecording by service.isAudioRecording.collectAsState()
+    val isVideoRecording by service.isVideoRecording.collectAsState()
+    val transcriptions by service.audioTranscriptions.collectAsState()
 
     val savedFiles = if (showAudio) audioFiles else videoFiles
-    val storagePath = if (showAudio) audioViewModel.storagePath else videoViewModel.storagePath
+    val storagePath = if (showAudio) service.audioStoragePath else service.videoStoragePath
     val isRecording = if (showAudio) isAudioRecording else isVideoRecording
 
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.US) }
@@ -86,7 +82,7 @@ fun RecordingsScreen(
                 title = { Text("Recordings") },
                 actions = {
                     IconButton(onClick = {
-                        if (showAudio) audioViewModel.loadSavedAudioFiles() else videoViewModel.loadSavedVideoFiles()
+                        if (showAudio) service.loadSavedAudioFiles() else service.loadSavedVideoFiles()
                     }) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Refresh list")
                     }
@@ -130,7 +126,7 @@ fun RecordingsScreen(
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text = "20s Segments",
+                        text = if (showAudio) "WAV" else "20s Segments",
                         color = Color.Gray,
                         fontSize = 12.sp,
                     )
@@ -150,9 +146,9 @@ fun RecordingsScreen(
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
                         text = if (isRecording) {
-                            "First 20s segment recording in progress..."
+                            if (showAudio) "Recording in progress..." else "First 20s segment recording in progress..."
                         } else {
-                            "No ${if (showAudio) "audio" else "video"} segments saved yet."
+                            if (showAudio) "No audio recordings saved yet." else "No video segments saved yet."
                         },
                         color = Color.Gray,
                     )
@@ -166,9 +162,9 @@ fun RecordingsScreen(
                             formattedDate = dateFormat.format(item.timestamp),
                             transcriptionState = if (showAudio) transcriptions[item.path] else null,
                             onDelete = {
-                                if (showAudio) audioViewModel.deleteAudioFile(item) else videoViewModel.deleteVideoFile(item)
+                                if (showAudio) service.deleteAudioFile(item) else service.deleteVideoFile(item)
                             },
-                            onRetryTranscription = { audioViewModel.retryTranscription(item) },
+                            onRetryTranscription = { service.retryAudioTranscription(item) },
                         )
                     }
                 }
@@ -187,7 +183,7 @@ private fun RecordingRow(
     onRetryTranscription: () -> Unit,
 ) {
     // Transcription now runs automatically as each segment is saved (see
-    // AudioRecorderViewModel's transcriptionQueue); this button only reveals
+    // AudioRecordingEngine's transcriptionQueue); this button only reveals
     // the result, it never triggers the model itself.
     var showTranscript by remember(item.path) { mutableStateOf(false) }
 

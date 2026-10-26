@@ -59,6 +59,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.service)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     implementation(libs.androidx.camera.core)
@@ -66,8 +67,10 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
+    implementation(libs.mlkit.barcode.scanning)
 
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.rootencoder)
 
     // litert-api's JNI shim (liblitert_jni.so) loads the actual LiteRT engine
     // (libLiteRt.so) at runtime. That .so ships in the separate "litert" AAR,

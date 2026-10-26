@@ -2,7 +2,7 @@ package com.example.sdtech_android_native.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
-import androidx.camera.view.PreviewView
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +31,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,8 +50,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.example.sdtech_android_native.data.VideoRecorderViewModel
+import com.example.sdtech_android_native.session.AppSessionService
 import com.example.sdtech_android_native.ui.theme.DeepPurple
 import com.example.sdtech_android_native.ui.theme.DeepPurple200
 import com.example.sdtech_android_native.ui.theme.DeepPurple400
@@ -60,9 +63,9 @@ import com.example.sdtech_android_native.ui.theme.RedAccent
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun VideoCaptureScreen(viewModel: VideoRecorderViewModel) {
-    val isRecording by viewModel.isRecording.collectAsState()
-    val isStarting by viewModel.isStarting.collectAsState()
+fun VideoCaptureScreen(service: AppSessionService, textureView: TextureView) {
+    val isRecording by service.isVideoRecording.collectAsState()
+    val isStarting by service.isVideoStarting.collectAsState()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -77,18 +80,30 @@ fun VideoCaptureScreen(viewModel: VideoRecorderViewModel) {
         ActivityResultContracts.RequestPermission(),
     ) { granted -> hasCameraPermission = granted }
 
-    // The camera is intentionally left unbound until the user taps Start —
-    // see the kdoc on VideoRecorderViewModel.startCapturing for why (binding
-    // it eagerly starves the audio encoder of the shared hardware codec).
-    // The PreviewView itself just renders black/empty until then, which is
-    // fine since the idle overlay below covers it anyway.
-    val previewView = remember { PreviewView(context) }
+    // Camera permission can also be granted from StreamingScreen's own
+    // launcher (both screens share this TextureView). Re-check on resume so
+    // this screen's AndroidView actually mounts the texture in that case —
+    // otherwise it stays stuck at whatever hasCameraPermission was on first
+    // composition, the TextureView never attaches, and the preview never
+    // appears/updates.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasCameraPermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA,
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     fun toggleVideoCapture() {
         if (isRecording) {
-            viewModel.stopCapturing()
+            service.stopVideoCapturing()
         } else if (hasCameraPermission) {
-            viewModel.startCapturing(lifecycleOwner, previewView)
+            textureView.surfaceTexture?.let { service.startVideoCapturing(it) }
         } else {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
@@ -130,7 +145,7 @@ fun VideoCaptureScreen(viewModel: VideoRecorderViewModel) {
                     if (hasCameraPermission) {
                         AndroidView(
                             modifier = Modifier.fillMaxSize(),
-                            factory = { previewView },
+                            factory = { textureView },
                         )
                     }
 

@@ -40,7 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import com.example.sdtech_android_native.data.AudioRecorderViewModel
+import com.example.sdtech_android_native.session.AppSessionService
 import com.example.sdtech_android_native.ui.theme.DeepPurple
 import com.example.sdtech_android_native.ui.theme.DeepPurple200
 import com.example.sdtech_android_native.ui.theme.DeepPurple300
@@ -52,26 +52,26 @@ import com.example.sdtech_android_native.ui.theme.SurfaceContainerHigh
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AudioCaptureScreen(viewModel: AudioRecorderViewModel) {
-    val isRecording by viewModel.isRecording.collectAsState()
+fun AudioCaptureScreen(service: AppSessionService) {
+    val isRecording by service.isAudioRecording.collectAsState()
     val context = LocalContext.current
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) viewModel.startCapturing()
+        if (granted) service.startAudioCapturing()
     }
 
     fun toggleAudioCapture() {
         if (isRecording) {
-            viewModel.stopCapturing()
+            service.stopAudioCapturing()
         } else {
             val hasPermission = ContextCompat.checkSelfPermission(
                 context,
                 Manifest.permission.RECORD_AUDIO,
             ) == PackageManager.PERMISSION_GRANTED
             if (hasPermission) {
-                viewModel.startCapturing()
+                service.startAudioCapturing()
             } else {
                 permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
@@ -156,7 +156,7 @@ fun AudioCaptureScreen(viewModel: AudioRecorderViewModel) {
                         }
                     } else {
                         Text(
-                            text = "Press the play button to start 20s interval recording",
+                            text = "Press the play button to start recording",
                             color = Color.Gray,
                             fontSize = 13.sp,
                         )
