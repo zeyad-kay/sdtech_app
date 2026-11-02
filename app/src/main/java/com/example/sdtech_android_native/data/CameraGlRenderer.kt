@@ -68,6 +68,18 @@ private val QUAD_TEX_COORDS = floatArrayOf(
  * through this renderer instead means both outputs get the same explicit
  * correction, so they match.
  *
+ * The phone is assumed to always be held upright (portrait), so both output
+ * surfaces are sized portrait ([outputWidth]/[outputHeight] — the camera's
+ * own capture size, [cameraWidth]/[cameraHeight], with width/height swapped).
+ * No additional rotation is applied beyond [SurfaceTexture.getTransformMatrix]
+ * — verified on-device (Samsung, this project's test hardware) that matrix
+ * alone already yields an upright portrait frame once the output surfaces are
+ * sized portrait, without a separate sensor-orientation rotation step. That
+ * implies the vendor camera HAL already bakes sensor-orientation compensation
+ * into the buffer/transform matrix here; a device whose HAL doesn't do that
+ * would need an explicit rotation added back in — re-verify on new hardware
+ * before assuming this holds everywhere.
+ *
  * All methods must be called from the same single thread throughout this
  * instance's lifetime (the caller owns that thread — see
  * [VideoRecordingEngine]'s dedicated GL thread) since an EGL context can only
@@ -76,8 +88,10 @@ private val QUAD_TEX_COORDS = floatArrayOf(
 class CameraGlRenderer(
     private val previewSurface: Surface,
     private val encoderSurface: Surface,
-    private val width: Int,
-    private val height: Int,
+    private val cameraWidth: Int,
+    private val cameraHeight: Int,
+    private val outputWidth: Int,
+    private val outputHeight: Int,
 ) {
     private var eglDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext = EGL14.EGL_NO_CONTEXT
@@ -111,7 +125,7 @@ class CameraGlRenderer(
         texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
 
         cameraSurfaceTexture = SurfaceTexture(cameraTextureId).apply {
-            setDefaultBufferSize(width, height)
+            setDefaultBufferSize(cameraWidth, cameraHeight)
         }
         cameraInputSurface = Surface(cameraSurfaceTexture)
     }
@@ -147,7 +161,7 @@ class CameraGlRenderer(
 
     private fun renderTo(eglSurface: EGLSurface, timestampNs: Long) {
         makeCurrent(eglSurface)
-        GLES20.glViewport(0, 0, width, height)
+        GLES20.glViewport(0, 0, outputWidth, outputHeight)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 

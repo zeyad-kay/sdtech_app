@@ -35,8 +35,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "VideoRecordingEngine"
 private const val SEGMENT_SECONDS = 20
-private const val VIDEO_WIDTH = 1280
-private const val VIDEO_HEIGHT = 720
+
+// The camera sensor only streams in its native (landscape) orientation.
+// CAPTURE_* sizes the camera's own input; OUTPUT_* (its dimensions swapped)
+// sizes the preview and encoder surfaces that receive CameraGlRenderer's
+// portrait-oriented result (see its kdoc). This assumes the phone is always
+// held upright.
+private const val CAPTURE_WIDTH = 1280
+private const val CAPTURE_HEIGHT = 720
+private const val OUTPUT_WIDTH = CAPTURE_HEIGHT
+private const val OUTPUT_HEIGHT = CAPTURE_WIDTH
 private const val VIDEO_BIT_RATE = 4_000_000
 private const val VIDEO_FRAME_RATE = 30
 private const val VIDEO_I_FRAME_INTERVAL = 2 // seconds
@@ -64,6 +72,13 @@ internal const val VIDEO_RECORD_HEADER_SIZE = 8 + 1 + 4
  * out flipped relative to what the on-screen preview shows. CameraX's
  * `Preview` use case isn't used here since it only supports a single output
  * and doesn't expose a way to tap the raw encoded bitstream either.
+ *
+ * The phone is assumed to always be held upright (portrait). The camera
+ * itself still streams at its native landscape size (see
+ * [CAPTURE_WIDTH]/[CAPTURE_HEIGHT]), but [CameraGlRenderer]'s preview/encoder
+ * output surfaces are sized portrait instead (see
+ * [OUTPUT_WIDTH]/[OUTPUT_HEIGHT], the capture size with width/height swapped)
+ * — see its kdoc for why no separate rotation step is needed on top of that.
  *
  * Every encoded frame is written to three places: a rotating [MediaMuxer]
  * producing the local 20s MP4 segments for the Recordings tab (rotation
@@ -151,7 +166,13 @@ class VideoRecordingEngine(private val context: Context) {
         _isStarting.value = true
 
         try {
-            previewSurfaceTexture.setDefaultBufferSize(VIDEO_WIDTH, VIDEO_HEIGHT)
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = manager.cameraIdList.firstOrNull { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_BACK
+            } ?: manager.cameraIdList.first()
+
+            previewSurfaceTexture.setDefaultBufferSize(OUTPUT_WIDTH, OUTPUT_HEIGHT)
             val previewSurface = Surface(previewSurfaceTexture)
 
             val encoder = createEncoder()
@@ -171,12 +192,6 @@ class VideoRecordingEngine(private val context: Context) {
 
             cameraThread = HandlerThread("VideoCameraThread").apply { start() }
             cameraHandler = Handler(cameraThread!!.looper)
-
-            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val cameraId = manager.cameraIdList.firstOrNull { id ->
-                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
-                    CameraCharacteristics.LENS_FACING_BACK
-            } ?: manager.cameraIdList.first()
 
             manager.openCamera(
                 cameraId,
@@ -223,7 +238,14 @@ class VideoRecordingEngine(private val context: Context) {
         var cameraSurface: Surface? = null
         handler.post {
             try {
-                val renderer = CameraGlRenderer(previewSurface, encoderSurface, VIDEO_WIDTH, VIDEO_HEIGHT)
+                val renderer = CameraGlRenderer(
+                    previewSurface,
+                    encoderSurface,
+                    cameraWidth = CAPTURE_WIDTH,
+                    cameraHeight = CAPTURE_HEIGHT,
+                    outputWidth = OUTPUT_WIDTH,
+                    outputHeight = OUTPUT_HEIGHT,
+                )
                 glRenderer = renderer
                 renderer.cameraSurfaceTexture.setOnFrameAvailableListener({ renderer.drawFrame() }, handler)
                 cameraSurface = renderer.cameraInputSurface
@@ -350,7 +372,7 @@ class VideoRecordingEngine(private val context: Context) {
     }
 
     private fun createEncoder(): MediaCodec {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT).apply {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, OUTPUT_WIDTH, OUTPUT_HEIGHT).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BIT_RATE)
             setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FRAME_RATE)
