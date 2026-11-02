@@ -119,10 +119,10 @@ class AppSessionService : LifecycleService() {
         return SessionClient.startSession(network, hotspotIp).getOrNull()
     }
 
-    /** Starts pushing the current recording session to [rtspUrl]. Call only once audio capture has actually started (needs its PCM file). */
+    /** Starts pushing the current recording session to [rtspUrl]. Call only once audio capture has actually started (needs its PCM file) — video capture, by contrast, is allowed to start later, since [StreamingEngine] polls for its scratch file. */
     fun startRtspStream(rtspUrl: String) {
         val pcmFile = audioEngine.currentPcmFile ?: return
-        streamingEngine.start(pcmFile, videoEngine.videoFormat, videoEngine.encodedFrames, rtspUrl)
+        streamingEngine.start(pcmFile, videoEngine.videoFormat, { videoEngine.currentVideoFile }, rtspUrl)
     }
 
     /**
@@ -141,6 +141,7 @@ class AppSessionService : LifecycleService() {
         streamingEngine.finishAndAwaitDrain {
             streamingEngine.stop()
             audioEngine.finalizeRecording()
+            videoEngine.finalizeRecording()
             lifecycleScope.launch {
                 val network = connectedNetworkOrNull()
                 val hotspotIp = network?.let { hotspotIpOrNull(it) }
@@ -170,6 +171,7 @@ class AppSessionService : LifecycleService() {
         audioEngine.stopCapturing()
         audioEngine.finalizeRecording()
         videoEngine.stopCapturing()
+        videoEngine.finalizeRecording()
         super.onDestroy()
     }
 

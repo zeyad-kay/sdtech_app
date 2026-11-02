@@ -11,7 +11,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
@@ -19,7 +18,6 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
-import java.util.concurrent.LinkedBlockingQueue
 
 private const val TAG = "StreamingEngine"
 
@@ -39,7 +37,6 @@ private const val AUDIO_SAMPLE_RATE = 16000
 private const val AUDIO_CHANNEL_COUNT = 1
 private const val AUDIO_BIT_RATE = 128_000
 private const val PCM_CHUNK_BYTES = 4096 // ~128ms at 16kHz mono 16-bit
-private const val MAX_PENDING_VIDEO_FRAMES = 600 // ~20s at 30fps — bounds memory during a long outage, dropping oldest once full
 
 /**
  * Pushes the in-progress recording to a server-provided RTSP URL (from the
@@ -50,17 +47,19 @@ private const val MAX_PENDING_VIDEO_FRAMES = 600 // ~20s at 30fps — bounds mem
  *
  * Audio: tails [AudioRecordingEngine]'s raw PCM scratch file byte-by-byte as it
  * grows, re-encoding each chunk to AAC via a persistent [MediaCodec] encoder.
- * Video: consumes [VideoRecordingEngine]'s already-encoded H.264 frames live,
- * the instant each one is produced (no re-encode, no waiting on a finished
- * segment file) — SPS/PPS come from [VideoRecordingEngine.videoFormat], known
- * as soon as its encoder starts.
+ * Video: tails [VideoRecordingEngine]'s raw scratch file the same way — one
+ * [VIDEO_RECORD_HEADER_SIZE]-prefixed record per encoded frame, already
+ * H.264, no re-encode needed — instead of consuming a live in-memory stream.
+ * SPS/PPS come from [VideoRecordingEngine.videoFormat], known as soon as its
+ * encoder starts.
  *
- * Audio pauses in place on a dropped connection (nothing is ever lost, just
- * delayed). Video is a bounded in-memory queue instead (see
- * [MAX_PENDING_VIDEO_FRAMES]) — unlike audio there's no backing file to resume
- * from, so an outage longer than that queue holds will drop the oldest frames
- * rather than grow unbounded. Reconnecting is gated on [wifiState] reporting [WifiConnectionState.Connected],
- * piggybacking on [com.example.sdtech_android_native.pairing.WifiConnector]'s own retry loop
+ * Both tails pause in place on a dropped connection — nothing is ever lost,
+ * just delayed, since each is reading from a file that keeps growing on disk
+ * regardless of whether anything is currently being sent. There's no
+ * in-memory queue or cap on either side; an outage of any length just delays
+ * the stream rather than dropping frames. Reconnecting is gated on
+ * [wifiState] reporting [WifiConnectionState.Connected], piggybacking on
+ * [com.example.sdtech_android_native.pairing.WifiConnector]'s own retry loop
  * rather than running an independent network probe.
  */
 class StreamingEngine(
@@ -89,15 +88,13 @@ class StreamingEngine(
     private var reconnectJob: Job? = null
     private var audioJob: Job? = null
     private var videoFormatJob: Job? = null
-    private var videoCollectJob: Job? = null
     private var videoDrainJob: Job? = null
 
     private var audioEncoder: MediaCodec? = null
-    private val pendingVideoFrames = LinkedBlockingQueue<EncodedVideoFrame>()
     @Volatile private var rtspUrl: String = ""
 
     // Set once recording has stopped (via finishAndAwaitDrain) — tailAudio/
-    // drainVideoFrames use this to know there's no more input coming, flush
+    // tailVideo use this to know there's no more input coming, flush
     // whatever's left (including a final partial audio chunk), and exit
     // instead of waiting forever for more.
     @Volatile private var recordingStopped = false
@@ -105,8 +102,15 @@ class StreamingEngine(
     @Volatile private var videoFullyDrained = false
     private var onFullyDrained: (() -> Unit)? = null
 
-    /** Starts streaming the session whose audio is tailed from [pcmFile], with video frames collected live from [videoFormat]/[encodedFrames], to [rtspUrl]. */
-    fun start(pcmFile: File, videoFormat: StateFlow<MediaFormat?>, encodedFrames: SharedFlow<EncodedVideoFrame>, rtspUrl: String) {
+    /**
+     * Starts streaming the session whose audio is tailed from [pcmFile] and
+     * video from whatever [getVideoFile] returns, to [rtspUrl]. [getVideoFile]
+     * is a provider rather than a plain [File] since [VideoRecordingEngine]
+     * may not have created its scratch file yet at the moment this is called
+     * (video and audio/streaming start independently) — [tailVideo] polls it
+     * the same way [tailAudio] already polls for [pcmFile] to exist.
+     */
+    fun start(pcmFile: File, videoFormat: StateFlow<MediaFormat?>, getVideoFile: () -> File?, rtspUrl: String) {
         if (running) return
         running = true
         videoInfoSet = false
@@ -115,7 +119,6 @@ class StreamingEngine(
         audioFullyDrained = false
         videoFullyDrained = !VIDEO_ENABLED
         this.rtspUrl = rtspUrl
-        pendingVideoFrames.clear()
 
         if (VIDEO_ENABLED) {
             videoFormatJob = scope.launch(Dispatchers.IO) {
@@ -128,13 +131,7 @@ class StreamingEngine(
                     }
                 }
             }
-            videoCollectJob = scope.launch(Dispatchers.IO) {
-                encodedFrames.collect { frame ->
-                    pendingVideoFrames.add(frame)
-                    while (pendingVideoFrames.size > MAX_PENDING_VIDEO_FRAMES) pendingVideoFrames.poll()
-                }
-            }
-            videoDrainJob = scope.launch(Dispatchers.IO) { drainVideoFrames() }
+            videoDrainJob = scope.launch(Dispatchers.IO) { tailVideo(getVideoFile) }
         }
         audioJob = scope.launch(Dispatchers.IO) { tailAudio(pcmFile) }
 
@@ -147,12 +144,10 @@ class StreamingEngine(
         reconnectJob?.cancel()
         audioJob?.cancel()
         videoFormatJob?.cancel()
-        videoCollectJob?.cancel()
         videoDrainJob?.cancel()
         reconnectJob = null
         audioJob = null
         videoFormatJob = null
-        videoCollectJob = null
         videoDrainJob = null
         onFullyDrained = null
         releaseAudioEncoder()
@@ -163,16 +158,15 @@ class StreamingEngine(
                 Log.e(TAG, "Error disconnecting RTSP client", e)
             }
         }
-        pendingVideoFrames.clear()
     }
 
     /**
      * Signals that recording has stopped — no more audio/video will ever
-     * arrive. Lets [tailAudio]/[drainVideoFrames] flush whatever is still
-     * queued (including a final partial audio chunk) instead of waiting
-     * forever for more, then invokes [onComplete] once everything has
-     * actually been sent — or immediately, if there was nothing left to send.
-     * Does not disconnect by itself; call [stop] from [onComplete].
+     * arrive. Lets [tailAudio]/[tailVideo] flush whatever is still queued
+     * (including a final partial audio chunk) instead of waiting forever for
+     * more, then invokes [onComplete] once everything has actually been sent
+     * — or immediately, if there was nothing left to send. Does not
+     * disconnect by itself; call [stop] from [onComplete].
      */
     fun finishAndAwaitDrain(onComplete: () -> Unit) {
         onFullyDrained = onComplete
@@ -225,9 +219,7 @@ class StreamingEngine(
     private fun giveUpOnVideo() {
         videoGivenUp = true
         videoFormatJob?.cancel()
-        videoCollectJob?.cancel()
         videoDrainJob?.cancel()
-        pendingVideoFrames.clear()
         videoFullyDrained = true
         maybeCompleteDrain()
     }
@@ -273,11 +265,18 @@ class StreamingEngine(
                     val readBuffer = ByteArray(chunkSize)
                     raf.seek(offset)
                     raf.readFully(readBuffer)
-                    offset += chunkSize
 
                     val ptsUs = samplesFed * 1_000_000L / AUDIO_SAMPLE_RATE
+                    // Only advance past this chunk once it's actually been handed to the
+                    // RTSP client successfully — a failed send (e.g. the connection just
+                    // dropped) must not be skipped over, or it's lost for good once we
+                    // reconnect and resume tailing from a later offset.
+                    if (!encodeAndSendAudio(encoder, bufferInfo, readBuffer, ptsUs)) {
+                        delay(IDLE_POLL_MS)
+                        continue
+                    }
+                    offset += chunkSize
                     samplesFed += chunkSize / (2 * AUDIO_CHANNEL_COUNT)
-                    encodeAndSendAudio(encoder, bufferInfo, readBuffer, ptsUs)
                 }
             }
         } catch (e: Exception) {
@@ -304,18 +303,25 @@ class StreamingEngine(
         null
     }
 
-    private fun encodeAndSendAudio(encoder: MediaCodec, bufferInfo: MediaCodec.BufferInfo, pcm: ByteArray, ptsUs: Long) {
+    /**
+     * Returns false if this chunk wasn't fully handed off to the RTSP client —
+     * either the encoder had no input buffer free (transient backpressure) or
+     * a [RtspClient.sendAudio] call threw (e.g. the connection just dropped) —
+     * so the caller knows not to advance past it, and retries the same PCM on
+     * the next call.
+     */
+    private fun encodeAndSendAudio(encoder: MediaCodec, bufferInfo: MediaCodec.BufferInfo, pcm: ByteArray, ptsUs: Long): Boolean {
         val inputIndex = encoder.dequeueInputBuffer(10_000)
-        if (inputIndex >= 0) {
-            val inputBuffer = encoder.getInputBuffer(inputIndex)
-            inputBuffer?.clear()
-            inputBuffer?.put(pcm)
-            encoder.queueInputBuffer(inputIndex, 0, pcm.size, ptsUs, 0)
-        }
+        if (inputIndex < 0) return false
+        val inputBuffer = encoder.getInputBuffer(inputIndex)
+        inputBuffer?.clear()
+        inputBuffer?.put(pcm)
+        encoder.queueInputBuffer(inputIndex, 0, pcm.size, ptsUs, 0)
 
+        var allSent = true
         while (true) {
             val outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-            if (outputIndex < 0) return
+            if (outputIndex < 0) return allSent
             val outputBuffer = encoder.getOutputBuffer(outputIndex)
             if (outputBuffer != null && bufferInfo.size > 0 && rtspClient.isStreaming) {
                 outputBuffer.position(bufferInfo.offset)
@@ -341,6 +347,7 @@ class StreamingEngine(
                     rtspClient.sendAudio(copy, copyInfo)
                 } catch (e: Exception) {
                     Log.e(TAG, "Error sending audio frame", e)
+                    allSent = false
                 }
             }
             encoder.releaseOutputBuffer(outputIndex, false)
@@ -361,33 +368,81 @@ class StreamingEngine(
         audioEncoder = null
     }
 
-    // --- Video: push each live encoded frame as it's produced ---
+    // --- Video: tail VideoRecordingEngine's raw scratch file, same approach as audio ---
 
-    private suspend fun drainVideoFrames() {
+    /**
+     * Mirrors [tailAudio] almost exactly, reading [VideoRecordingEngine]'s
+     * [VIDEO_RECORD_HEADER_SIZE]-prefixed records instead of fixed-size PCM
+     * chunks: wait for the file (via [getVideoFile], polled since it may not
+     * exist yet), then tail it by byte offset, re-sending each complete
+     * record as-is (already H.264, no re-encode).
+     */
+    private suspend fun tailVideo(getVideoFile: () -> File?) {
+        var videoFile: File?
+        while (true) {
+            if (!scope.isActive || !running) return
+            videoFile = getVideoFile()
+            if (videoFile != null && videoFile.exists()) break
+            delay(IDLE_POLL_MS)
+        }
+
+        var offset = 0L
         try {
-            while (scope.isActive && running) {
-                if (!rtspClient.isStreaming) {
-                    delay(IDLE_POLL_MS)
-                    continue
-                }
-                val frame = pendingVideoFrames.poll()
-                if (frame == null) {
-                    if (recordingStopped) break // nothing left, ever — fully drained
-                    delay(IDLE_POLL_MS)
-                    continue
-                }
-                val bufferInfo = MediaCodec.BufferInfo().apply {
-                    offset = 0
-                    size = frame.size
-                    presentationTimeUs = frame.presentationTimeUs
-                    flags = if (frame.isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                }
-                try {
-                    rtspClient.sendVideo(frame.data.duplicate(), bufferInfo)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error sending video frame", e)
+            RandomAccessFile(videoFile, "r").use { raf ->
+                while (scope.isActive && running) {
+                    if (!rtspClient.isStreaming) {
+                        delay(IDLE_POLL_MS)
+                        continue
+                    }
+                    val available = raf.length() - offset
+                    if (available < VIDEO_RECORD_HEADER_SIZE) {
+                        if (recordingStopped && available <= 0) break // nothing left, ever — fully drained
+                        delay(IDLE_POLL_MS)
+                        continue
+                    }
+
+                    raf.seek(offset)
+                    val presentationTimeUs = raf.readLong()
+                    val isKeyFrame = raf.readBoolean()
+                    val size = raf.readInt()
+                    val recordSize = VIDEO_RECORD_HEADER_SIZE + size
+                    if (available < recordSize) {
+                        // Header landed but the payload hasn't fully flushed
+                        // yet — don't advance offset, re-read this same
+                        // record once more data is on disk.
+                        delay(IDLE_POLL_MS)
+                        continue
+                    }
+
+                    val frameBytes = ByteArray(size)
+                    raf.readFully(frameBytes)
+
+                    val bufferInfo = MediaCodec.BufferInfo().apply {
+                        this.offset = 0
+                        this.size = size
+                        this.presentationTimeUs = presentationTimeUs
+                        flags = if (isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                    }
+                    // Only advance past this record once it's actually been sent —
+                    // a failed send (e.g. the connection just dropped) must not be
+                    // skipped over, or it's lost for good once we reconnect and
+                    // resume tailing from a later offset.
+                    val sent = try {
+                        rtspClient.sendVideo(ByteBuffer.wrap(frameBytes), bufferInfo)
+                        true
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error sending video frame", e)
+                        false
+                    }
+                    if (!sent) {
+                        delay(IDLE_POLL_MS)
+                        continue
+                    }
+                    offset += recordSize
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error tailing video", e)
         } finally {
             videoFullyDrained = true
             maybeCompleteDrain()

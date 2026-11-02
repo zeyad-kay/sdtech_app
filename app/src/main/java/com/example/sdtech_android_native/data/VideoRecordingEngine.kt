@@ -17,14 +17,14 @@ import android.util.Log
 import android.view.Surface
 import com.example.sdtech_android_native.model.MediaType
 import com.example.sdtech_android_native.model.SavedMediaItem
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.io.BufferedOutputStream
+import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -41,22 +41,17 @@ private const val VIDEO_BIT_RATE = 4_000_000
 private const val VIDEO_FRAME_RATE = 30
 private const val VIDEO_I_FRAME_INTERVAL = 2 // seconds
 
-/** One encoded H.264 access unit, with its own independent copy of the data — safe to hold onto after the codec reuses its internal output buffer. */
-data class EncodedVideoFrame(
-    val data: ByteBuffer,
-    val size: Int,
-    val presentationTimeUs: Long,
-    val isKeyFrame: Boolean,
-)
+// Raw scratch file record layout, one per encoded frame, written back-to-back:
+// [8 bytes presentationTimeUs][1 byte isKeyFrame][4 bytes size][size bytes payload]
+// Visible to StreamingEngine (same module, same package), which tails this
+// file and must parse the exact same layout.
+internal const val VIDEO_RECORD_HEADER_SIZE = 8 + 1 + 4
 
 /**
  * Records video via a raw Camera2 + [MediaCodec] pipeline (not CameraX's
  * high-level `Recorder`), so the encoded H.264 bitstream — and its SPS/PPS —
  * are available the instant the encoder starts producing output, not only
- * once a finished segment file exists. This lets
- * [com.example.sdtech_android_native.data.StreamingEngine] push video live,
- * the same way it already tails audio, instead of waiting up to
- * [SEGMENT_SECONDS] for the first usable file.
+ * once a finished segment file exists.
  *
  * The camera's only capture target is [CameraGlRenderer]'s own
  * camera-facing `SurfaceTexture` — not the live preview or the encoder
@@ -70,10 +65,15 @@ data class EncodedVideoFrame(
  * `Preview` use case isn't used here since it only supports a single output
  * and doesn't expose a way to tap the raw encoded bitstream either.
  *
- * The same encoder output still feeds a rotating [MediaMuxer], producing the
- * local 20s MP4 segments for the Recordings tab exactly as before; rotation
- * happens inline on the drain thread (not a separate coroutine) so muxer
- * access is never touched from two threads at once.
+ * Every encoded frame is written to three places: a rotating [MediaMuxer]
+ * producing the local 20s MP4 segments for the Recordings tab (rotation
+ * happens inline on the drain thread, not a separate coroutine, so muxer
+ * access is never touched from two threads at once); and [currentVideoFile],
+ * one continuously-growing raw scratch file for the whole session (see
+ * [VIDEO_RECORD_HEADER_SIZE]) that [com.example.sdtech_android_native.data.StreamingEngine]
+ * tails byte-by-byte to push live, the same way it already tails
+ * [AudioRecordingEngine]'s PCM file — so a dropped connection just delays the
+ * stream instead of losing frames, with no in-memory frame queue/cap needed.
  */
 class VideoRecordingEngine(private val context: Context) {
 
@@ -95,9 +95,8 @@ class VideoRecordingEngine(private val context: Context) {
     private val _videoFormat = MutableStateFlow<MediaFormat?>(null)
     val videoFormat: StateFlow<MediaFormat?> = _videoFormat.asStateFlow()
 
-    /** Every encoded frame, emitted live as the encoder produces it — for the streaming engine to push immediately, no file wait. */
-    private val _encodedFrames = MutableSharedFlow<EncodedVideoFrame>(extraBufferCapacity = 256)
-    val encodedFrames: SharedFlow<EncodedVideoFrame> = _encodedFrames.asSharedFlow()
+    /** The current session's raw video scratch file — see the class kdoc. Null until [startCapturing] creates it. */
+    var currentVideoFile: File? = null
 
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
@@ -162,8 +161,11 @@ class VideoRecordingEngine(private val context: Context) {
 
             startNewSegment()
 
+            val scratchFile = generateVideoScratchFile()
+            currentVideoFile = scratchFile
+
             shouldDrain.set(true)
-            drainThread = Thread({ runDrainLoop(encoder) }, "VideoDrainThread").apply { start() }
+            drainThread = Thread({ runDrainLoop(encoder, scratchFile) }, "VideoDrainThread").apply { start() }
 
             val cameraSurface = startGlRenderer(previewSurface, encoderSurface)
 
@@ -301,6 +303,20 @@ class VideoRecordingEngine(private val context: Context) {
         _videoFormat.value = null
     }
 
+    /**
+     * Discards [currentVideoFile] — call once nothing else needs to read it
+     * (i.e. once [com.example.sdtech_android_native.data.StreamingEngine] has
+     * confirmed it finished draining it; see
+     * [AudioRecordingEngine.finalizeRecording], which this mirrors). It's
+     * purely a relay for live streaming, not a saved artifact — the muxer
+     * segments are the actual Recordings-tab output — so there's nothing to
+     * register here, just cleanup.
+     */
+    fun finalizeRecording() {
+        currentVideoFile?.delete()
+        currentVideoFile = null
+    }
+
     /** Releases [glRenderer] on [glThread] itself — EGL/GL calls must happen on the thread that owns the context — then tears the thread down. */
     private fun stopGlRenderer() {
         val handler = glHandler
@@ -350,58 +366,78 @@ class VideoRecordingEngine(private val context: Context) {
         }
     }
 
-    /** Runs on [drainThread]: pulls encoded output from the encoder, forwards it live, writes it to the current segment's muxer, and rotates segments — all single-threaded, so muxer access is never raced. */
-    private fun runDrainLoop(encoder: MediaCodec) {
+    /**
+     * Runs on [drainThread]: pulls encoded output from the encoder, writes it
+     * to [scratchFile] for [StreamingEngine] to tail live, writes it to the
+     * current segment's muxer, and rotates segments — all single-threaded, so
+     * muxer access is never raced.
+     */
+    private fun runDrainLoop(encoder: MediaCodec, scratchFile: File) {
         val bufferInfo = MediaCodec.BufferInfo()
         var segmentStartUs = -1L
 
-        while (shouldDrain.get()) {
-            val outputIndex = try {
-                encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error dequeuing encoder output — stopping capture", e)
-                failCapture()
-                break
-            }
+        try {
+            DataOutputStream(BufferedOutputStream(FileOutputStream(scratchFile))).use { rawOut ->
+                while (shouldDrain.get()) {
+                    val outputIndex = try {
+                        encoder.dequeueOutputBuffer(bufferInfo, 10_000)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error dequeuing encoder output — stopping capture", e)
+                        failCapture()
+                        break
+                    }
 
-            when {
-                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    _videoFormat.value = encoder.outputFormat
-                    addMuxerTrackIfReady()
-                }
+                    when {
+                        outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            _videoFormat.value = encoder.outputFormat
+                            addMuxerTrackIfReady()
+                        }
 
-                outputIndex >= 0 -> {
-                    if (bufferInfo.size > 0 && bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                        val outputBuffer = encoder.getOutputBuffer(outputIndex)
-                        if (outputBuffer != null) {
-                            if (segmentStartUs < 0) segmentStartUs = bufferInfo.presentationTimeUs
+                        outputIndex >= 0 -> {
+                            if (bufferInfo.size > 0 && bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                val outputBuffer = encoder.getOutputBuffer(outputIndex)
+                                if (outputBuffer != null) {
+                                    if (segmentStartUs < 0) segmentStartUs = bufferInfo.presentationTimeUs
 
-                            outputBuffer.position(bufferInfo.offset)
-                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            val copy = ByteBuffer.allocateDirect(bufferInfo.size).apply {
-                                put(outputBuffer)
-                                flip()
+                                    val isKeyFrame = bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                                    outputBuffer.position(bufferInfo.offset)
+                                    outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                    val frameBytes = ByteArray(bufferInfo.size)
+                                    outputBuffer.get(frameBytes)
+
+                                    writeRawFrame(rawOut, frameBytes, bufferInfo.presentationTimeUs, isKeyFrame)
+
+                                    outputBuffer.position(bufferInfo.offset)
+                                    writeToMuxer(outputBuffer, bufferInfo)
+
+                                    val elapsedUs = bufferInfo.presentationTimeUs - segmentStartUs
+                                    _secondsRemaining.value = (SEGMENT_SECONDS - elapsedUs / 1_000_000).toInt().coerceAtLeast(0)
+                                    // Only cut a new segment on a keyframe boundary, so every
+                                    // segment file is independently decodable from its first sample.
+                                    if (elapsedUs >= SEGMENT_SECONDS * 1_000_000L && isKeyFrame) {
+                                        rotateSegment()
+                                        segmentStartUs = bufferInfo.presentationTimeUs
+                                        _secondsRemaining.value = SEGMENT_SECONDS
+                                    }
+                                }
                             }
-                            val isKeyFrame = bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-
-                            _encodedFrames.tryEmit(EncodedVideoFrame(copy, bufferInfo.size, bufferInfo.presentationTimeUs, isKeyFrame))
-                            writeToMuxer(copy.duplicate(), bufferInfo)
-
-                            val elapsedUs = bufferInfo.presentationTimeUs - segmentStartUs
-                            _secondsRemaining.value = (SEGMENT_SECONDS - elapsedUs / 1_000_000).toInt().coerceAtLeast(0)
-                            // Only cut a new segment on a keyframe boundary, so every
-                            // segment file is independently decodable from its first sample.
-                            if (elapsedUs >= SEGMENT_SECONDS * 1_000_000L && isKeyFrame) {
-                                rotateSegment()
-                                segmentStartUs = bufferInfo.presentationTimeUs
-                                _secondsRemaining.value = SEGMENT_SECONDS
-                            }
+                            encoder.releaseOutputBuffer(outputIndex, false)
                         }
                     }
-                    encoder.releaseOutputBuffer(outputIndex, false)
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error writing video scratch file", e)
         }
+    }
+
+    /** Appends one [VIDEO_RECORD_HEADER_SIZE]-prefixed record to the scratch file — flushed immediately so [StreamingEngine]'s concurrent tailing reader sees it promptly. */
+    private fun writeRawFrame(out: DataOutputStream, frameBytes: ByteArray, presentationTimeUs: Long, isKeyFrame: Boolean) {
+        out.writeLong(presentationTimeUs)
+        out.writeBoolean(isKeyFrame)
+        out.writeInt(frameBytes.size)
+        out.write(frameBytes)
+        out.flush()
     }
 
     /**
@@ -487,5 +523,10 @@ class VideoRecordingEngine(private val context: Context) {
     private fun generateVideoFile(): File {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         return File(context.filesDir, "video_$timestamp.mp4")
+    }
+
+    private fun generateVideoScratchFile(): File {
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        return File(context.filesDir, "video_scratch_$timestamp.raw")
     }
 }

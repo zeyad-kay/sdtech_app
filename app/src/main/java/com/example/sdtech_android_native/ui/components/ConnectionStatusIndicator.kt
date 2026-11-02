@@ -28,22 +28,22 @@ import com.example.sdtech_android_native.pairing.WifiConnectionState
 
 private val ConnectedColor = Color(0xFF2ECC71)
 private val ConnectingColor = Color(0xFFF1C40F)
-private val DisconnectedColor = Color(0xFFE74C3C)
 
-/** Small dot + label showing the paired WiFi connection's live state: green/solid when connected, yellow/blinking while (re)connecting, red when disconnected. */
+/**
+ * Small dot + label showing the paired WiFi connection's live state:
+ * green/solid when connected, yellow/blinking otherwise. [WifiConnectionState.Disconnected]
+ * is treated the same as [WifiConnectionState.Connecting] rather than shown
+ * as a separate (e.g. red) state — a reconnect attempt always starts
+ * immediately after a disconnect (see [com.example.sdtech_android_native.pairing.WifiConnector]),
+ * so a distinct disconnected state would only ever flash briefly and adds
+ * nothing actionable.
+ */
 @Composable
 fun ConnectionStatusIndicator(state: WifiConnectionState, modifier: Modifier = Modifier) {
-    val isConnecting = state is WifiConnectionState.Connecting
-    val color = when (state) {
-        is WifiConnectionState.Connected -> ConnectedColor
-        is WifiConnectionState.Connecting -> ConnectingColor
-        is WifiConnectionState.Idle, is WifiConnectionState.Disconnected -> DisconnectedColor
-    }
-    val label = when (state) {
-        is WifiConnectionState.Connected -> "Connected"
-        is WifiConnectionState.Connecting -> "Connecting"
-        is WifiConnectionState.Idle, is WifiConnectionState.Disconnected -> "Disconnected"
-    }
+    val isConnected = state is WifiConnectionState.Connected
+    val isConnecting = !isConnected
+    val color = if (isConnected) ConnectedColor else ConnectingColor
+    val label = if (isConnected) "Connected" else "Connecting"
 
     val infiniteTransition = rememberInfiniteTransition(label = "connection-status-blink")
     val blinkAlpha by infiniteTransition.animateFloat(
