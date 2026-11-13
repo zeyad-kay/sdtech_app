@@ -5,14 +5,12 @@ plugins {
 
 android {
     namespace = "com.example.sdtech_android_native"
-    compileSdk {
-        version = release(37)
-    }
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.sdtech_android_native"
         minSdk = 30
-        targetSdk = 37
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 

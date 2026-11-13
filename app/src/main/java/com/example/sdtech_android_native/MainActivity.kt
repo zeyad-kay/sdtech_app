@@ -1,16 +1,21 @@
 package com.example.sdtech_android_native
 
+import android.Manifest
 import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import android.view.TextureView
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -22,13 +27,16 @@ import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -64,57 +72,106 @@ class MainActivity : ComponentActivity() {
             SdtechAndroidNativeTheme {
                 val context = LocalContext.current
 
-                // The WiFi connection and audio/video capture are all owned
-                // by one foreground service (not this Activity/Composable),
-                // so they survive the Activity backgrounding — e.g. on
-                // screen timeout — see AppSessionService's kdoc.
-                var session by remember { mutableStateOf<AppSessionService?>(null) }
-                DisposableEffect(Unit) {
-                    val intent = Intent(context, AppSessionService::class.java)
-                    val connection = object : ServiceConnection {
-                        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                            session = (binder as AppSessionService.LocalBinder).getService()
-                        }
+                var permissionsGranted by remember {
+                    mutableStateOf(
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED &&
+                            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    )
+                }
 
-                        override fun onServiceDisconnected(name: ComponentName?) {
-                            session = null
-                        }
-                    }
-                    ContextCompat.startForegroundService(context, intent)
-                    context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-                    onDispose {
-                        context.unbindService(connection)
-                        context.stopService(intent)
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestMultiplePermissions()
+                ) { result ->
+                    permissionsGranted = result.values.all { it }
+                }
+
+                LaunchedEffect(Unit) {
+                    if (!permissionsGranted) {
+                        permissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.CAMERA,
+                                Manifest.permission.RECORD_AUDIO
+                            )
+                        )
                     }
                 }
 
-                val service = session
-                val fallbackWifiState = remember { MutableStateFlow<WifiConnectionState>(WifiConnectionState.Idle) }
-                val connectionState by (service?.wifiState ?: fallbackWifiState).collectAsState()
-
-                // Pairing is required on every launch (in-memory only, not
-                // persisted), so this is re-prompted each time the process
-                // starts rather than just once per install. Once paired, the
-                // app stays on the main screens even if the WiFi connection
-                // later drops — connectionState keeps updating live and is
-                // reflected by the connection indicator instead.
-                var pairedInfo by remember { mutableStateOf<PairingInfo?>(null) }
-
-                val paired = pairedInfo
-                if (service == null) {
-                    // Binding is same-process and effectively instant; nothing to show meaningfully here.
-                } else if (paired == null) {
-                    QrScanScreen(
-                        connectionState = connectionState,
-                        onConnect = { ssid, passphrase -> service.connectWifi(ssid, passphrase) },
-                        onPaired = { info -> pairedInfo = info },
-                    )
+                if (!permissionsGranted) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(24.dp)
+                        ) {
+                            Text("Camera and Microphone permissions are required to run this app.")
+                            Spacer(modifier = Modifier.padding(8.dp))
+                            Button(onClick = {
+                                permissionLauncher.launch(
+                                    arrayOf(
+                                        Manifest.permission.CAMERA,
+                                        Manifest.permission.RECORD_AUDIO
+                                    )
+                                )
+                            }) {
+                                Text("Grant Permissions")
+                            }
+                        }
+                    }
                 } else {
-                    MainNavigationScreen(
-                        pairing = paired,
-                        connectionState = connectionState,
-                        service = service,
-                    )
+                    // The WiFi connection and audio/video capture are all owned
+                    // by one foreground service (not this Activity/Composable),
+                    // so they survive the Activity backgrounding — e.g. on
+                    // screen timeout — see AppSessionService's kdoc.
+                    var session by remember { mutableStateOf<AppSessionService?>(null) }
+                    DisposableEffect(Unit) {
+                        val intent = Intent(context, AppSessionService::class.java)
+                        val connection = object : ServiceConnection {
+                            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                                session = (binder as AppSessionService.LocalBinder).getService()
+                            }
+
+                            override fun onServiceDisconnected(name: ComponentName?) {
+                                session = null
+                            }
+                        }
+                        ContextCompat.startForegroundService(context, intent)
+                        context.bindService(intent, connection, BIND_AUTO_CREATE)
+                        onDispose {
+                            context.unbindService(connection)
+                            context.stopService(intent)
+                        }
+                    }
+
+                    val service = session
+                    val fallbackWifiState = remember { MutableStateFlow<WifiConnectionState>(WifiConnectionState.Idle) }
+                    val connectionState by (service?.wifiState ?: fallbackWifiState).collectAsState()
+
+                    // Pairing is required on every launch (in-memory only, not
+                    // persisted), so this is re-prompted each time the process
+                    // starts rather than just once per install. Once paired, the
+                    // app stays on the main screens even if the WiFi connection
+                    // later drops — connectionState keeps updating live and is
+                    // reflected by the connection indicator instead.
+                    var pairedInfo by remember { mutableStateOf<PairingInfo?>(null) }
+
+                    val paired = pairedInfo
+                    if (service == null) {
+                        // Binding is same-process and effectively instant; nothing to show meaningfully here.
+                    } else if (paired == null) {
+                        QrScanScreen(
+                            connectionState = connectionState,
+                            onConnect = { ssid, passphrase -> service.connectWifi(ssid, passphrase) },
+                            onPaired = { info -> pairedInfo = info },
+                        )
+                    } else {
+                        MainNavigationScreen(
+                            pairing = paired,
+                            connectionState = connectionState,
+                            service = service,
+                        )
+                    }
                 }
             }
         }
@@ -145,7 +202,7 @@ fun MainNavigationScreen(
                         Icon(
                             imageVector = if (currentIndex == 0) Icons.Filled.Wifi else Icons.Filled.WifiOff,
                             contentDescription = null,
-                            tint = if (currentIndex == 0) DeepPurpleAccent else androidx.compose.material3.LocalContentColor.current,
+                            tint = if (currentIndex == 0) DeepPurpleAccent else LocalContentColor.current,
                         )
                     },
                     label = { Text("Streaming") },
@@ -157,7 +214,7 @@ fun MainNavigationScreen(
                         Icon(
                             imageVector = if (currentIndex == 1) Icons.Filled.Mic else Icons.Filled.MicNone,
                             contentDescription = null,
-                            tint = if (currentIndex == 1) DeepPurpleAccent else androidx.compose.material3.LocalContentColor.current,
+                            tint = if (currentIndex == 1) DeepPurpleAccent else LocalContentColor.current,
                         )
                     },
                     label = { Text("Audio Capture") },
@@ -169,7 +226,7 @@ fun MainNavigationScreen(
                         Icon(
                             imageVector = if (currentIndex == 2) Icons.Filled.Videocam else Icons.Filled.VideocamOff,
                             contentDescription = null,
-                            tint = if (currentIndex == 2) DeepPurpleAccent else androidx.compose.material3.LocalContentColor.current,
+                            tint = if (currentIndex == 2) DeepPurpleAccent else LocalContentColor.current,
                         )
                     },
                     label = { Text("Video Capture") },
@@ -181,7 +238,7 @@ fun MainNavigationScreen(
                         Icon(
                             imageVector = if (currentIndex == 3) Icons.Filled.Folder else Icons.Filled.FolderOpen,
                             contentDescription = null,
-                            tint = if (currentIndex == 3) DeepPurpleAccent else androidx.compose.material3.LocalContentColor.current,
+                            tint = if (currentIndex == 3) DeepPurpleAccent else LocalContentColor.current,
                         )
                     },
                     label = { Text("Recordings") },
